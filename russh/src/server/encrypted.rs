@@ -628,6 +628,40 @@ mod tests {
         channel
     }
 
+    /// A locally-initiated close (`Session::close`) must drop the `ChannelRef`
+    /// from `Session.channels`: once CHANNEL_CLOSE is queued, `Encrypted::close`
+    /// has removed the channel, so the peer's echoed CHANNEL_CLOSE fails
+    /// `is_established_channel` and never reaches `channels` — leaking the
+    /// handle (mpsc queue + window-size handles) for the rest of the session.
+    #[tokio::test]
+    async fn local_close_releases_channel_handle() {
+        let mut session = test_authenticated_session();
+
+        // A confirmed server-initiated open, as the local side would have
+        // after the peer accepts it.
+        let channel = insert_unconfirmed_server_open(&mut session);
+        session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .channels
+            .get_mut(&channel)
+            .expect("channel params present")
+            .confirmed = true;
+        assert!(session.channels.contains_key(&channel));
+
+        // Local side closes the channel. The encrypted table entry goes away
+        // (as it would once CHANNEL_CLOSE is queued), and so must the handle.
+        session.close(channel).unwrap();
+
+        assert!(
+            !session.channels.contains_key(&channel),
+            "Session::close must drop the ChannelRef; otherwise locally-closed \
+             channels leak for the lifetime of the session"
+        );
+    }
+
     fn publickey_probe_packet(user: &str, public_key: &PublicKey) -> Vec<u8> {
         let mut packet = Vec::new();
         packet.push(msg::USERAUTH_REQUEST);

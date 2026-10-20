@@ -2423,6 +2423,92 @@ mod tests {
         session
     }
 
+    /// Mirrors the server-side test of the same name: a locally-initiated close
+    /// must drop the `ChannelRef` from `Session.channels`, since the server's
+    /// echoed CHANNEL_CLOSE fails `is_established_channel` and never reaches
+    /// `channels` — leaking the handle for the rest of the session.
+    #[tokio::test]
+    async fn local_close_releases_channel_handle() {
+        let config = Arc::new(Config::default());
+        let (window_size, maximum_packet_size) = (config.window_size, config.maximum_packet_size);
+        let (receiver_sender, receiver) = channel(config.channel_buffer_size);
+        let (reply_sender, _) = unbounded_channel();
+        let mut session = Session::new(
+            window_size,
+            CommonSession {
+                auth_user: String::new(),
+                auth_attempts: 0,
+                auth_method: None,
+                remote_to_local: Box::new(cipher::clear::Key),
+                encrypted: Some(Encrypted {
+                    state: EncryptedState::Authenticated,
+                    exchange: Some(Exchange::default()),
+                    kex: KEXES.get(&NONE).unwrap().make(),
+                    key: 0,
+                    client_mac: mac::NONE,
+                    server_mac: mac::NONE,
+                    session_id: CryptoVec::new(),
+                    channels: HashMap::new(),
+                    last_channel_id: Wrapping(0),
+                    write: Vec::new(),
+                    write_cursor: 0,
+                    last_rekey: russh_util::time::Instant::now(),
+                    server_compression: Compression::None,
+                    client_compression: Compression::None,
+                    decompress: Decompress::None,
+                    rekey_wanted: false,
+                    received_extensions: Vec::new(),
+                    extension_info_awaiters: HashMap::new(),
+                }),
+                config,
+                wants_reply: false,
+                disconnected: false,
+                buffer: Vec::new(),
+                strict_kex: false,
+                alive_timeouts: 0,
+                received_data: false,
+                remote_sshid: b"SSH-2.0-test".to_vec(),
+                packet_writer: PacketWriter::clear(),
+            },
+            receiver,
+            reply_sender,
+        );
+        let _ = receiver_sender;
+        session.open_global_requests = VecDeque::new();
+
+        // A confirmed channel, as the local side has once the peer accepts it.
+        let channel = session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .new_channel(window_size, maximum_packet_size);
+        session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .channels
+            .get_mut(&channel)
+            .expect("channel params present")
+            .confirmed = true;
+        let (sender, _channel_receiver) = tokio::sync::mpsc::channel(1);
+        session
+            .channels
+            .insert(channel, ChannelRef::new(sender));
+        assert!(session.channels.contains_key(&channel));
+
+        // Local side closes the channel. The encrypted table entry goes away
+        // (as it would once CHANNEL_CLOSE is queued), and so must the handle.
+        session.close(channel).unwrap();
+
+        assert!(
+            !session.channels.contains_key(&channel),
+            "Session::close must drop the ChannelRef; otherwise locally-closed \
+             channels leak for the lifetime of the session"
+        );
+    }
+
     fn oversized_prompt_count_packet() -> Vec<u8> {
         let mut packet = Vec::new();
         msg::USERAUTH_INFO_REQUEST_OR_USERAUTH_PK_OK
