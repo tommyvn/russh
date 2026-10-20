@@ -3,6 +3,7 @@ use ssh_encoding::Encode;
 use tokio::sync::oneshot;
 
 use crate::client::Session;
+use crate::channels::ChannelMsg;
 use crate::session::EncryptedState;
 use crate::{ChannelId, CryptoVec, Disconnect, Pty, Sig, map_err, msg};
 
@@ -539,10 +540,15 @@ impl Session {
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.close(channel)
+            enc.close(channel)?;
         } else {
             unreachable!()
         }
+        if let Some(chan) = self.channels.remove(&channel) {
+            // Best effort: wake a consumer parked in `Channel::wait()`.
+            let _ = chan.try_send(ChannelMsg::Close);
+        }
+        Ok(())
     }
 
     pub fn extended_data(

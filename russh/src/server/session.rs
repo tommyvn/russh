@@ -1150,10 +1150,15 @@ impl Session {
     /// Close a channel.
     pub fn close(&mut self, channel: ChannelId) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.close(channel)
+            enc.close(channel)?;
         } else {
             unreachable!()
         }
+        if let Some(chan) = self.channels.remove(&channel) {
+            // Best effort: wake a consumer parked in `Channel::wait()`.
+            let _ = chan.try_send(ChannelMsg::Close);
+        }
+        Ok(())
     }
 
     /// Send EOF to a channel
