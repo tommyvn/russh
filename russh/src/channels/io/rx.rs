@@ -34,13 +34,22 @@ where
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let mut dequeued = false;
         let (msg, mut idx) = match self.buffer.take() {
             Some(msg) => msg,
             None => match ready!(self.channel.borrow_mut().receiver.poll_recv(cx)) {
-                Some(msg) => (msg, 0),
+                Some(msg) => {
+                    dequeued = true;
+                    (msg, 0)
+                }
                 None => return Poll::Ready(Ok(())),
             },
         };
+        if dequeued {
+            // The queue has room again: let the session retry what it parked
+            // for this channel.
+            self.channel.borrow().notify_drained();
+        }
 
         match (&msg, self.ext) {
             (ChannelMsg::Data { data }, None) => {

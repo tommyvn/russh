@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -138,11 +139,62 @@ impl WindowSizeRef {
     }
 }
 
+/// Tells the session when the application has made room in a channel queue
+/// that the session is holding messages for.
+///
+/// `parked` is set before the session attempts a send and cleared when the
+/// send succeeds, so a drain racing with the send either lets the send succeed
+/// or observes the flag as set.
+#[derive(Debug)]
+pub(crate) struct DrainSignal {
+    notify: Arc<Notify>,
+    parked: AtomicBool,
+}
+
+impl DrainSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            parked: AtomicBool::new(false),
+        }
+    }
+
+    /// Note that the session may hold messages for this channel.
+    pub(crate) fn park(&self) {
+        self.parked.store(true, Ordering::Release);
+    }
+
+    /// Note that the session holds no more messages for this channel.
+    pub(crate) fn unpark(&self) {
+        self.parked.store(false, Ordering::Release);
+    }
+
+    /// Whether the session may be holding messages for this channel.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::Acquire)
+    }
+
+    /// Wake the session if it holds messages for this channel.
+    pub(crate) fn notify_if_parked(&self) {
+        if self.is_parked() {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Wait until the application may have made room for parked messages.
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// A handle to the reading part of a session channel.
 ///
 /// Allows you to read from a channel without borrowing the session
 pub struct ChannelReadHalf {
     pub(crate) receiver: Receiver<ChannelMsg>,
+    /// Wakes the session so it can retry the messages parked for this channel
+    /// once the application has made room.
+    pub(crate) drain_signal: Option<Arc<DrainSignal>>,
 }
 
 impl std::fmt::Debug for ChannelReadHalf {
@@ -154,7 +206,18 @@ impl std::fmt::Debug for ChannelReadHalf {
 impl ChannelReadHalf {
     /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
     pub async fn wait(&mut self) -> Option<ChannelMsg> {
-        self.receiver.recv().await
+        let msg = self.receiver.recv().await;
+        if msg.is_some() {
+            self.notify_drained();
+        }
+        msg
+    }
+
+    /// Wake the session so it can retry the messages parked for this channel.
+    pub(crate) fn notify_drained(&self) {
+        if let Some(signal) = &self.drain_signal {
+            signal.notify_if_parked();
+        }
     }
 
     /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
@@ -465,10 +528,14 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
         max_packet_size: u32,
         window_size: u32,
         channel_buffer_size: usize,
+        drain_signal: Option<Arc<DrainSignal>>,
     ) -> (Self, ChannelRef) {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
         let window_size = WindowSizeRef::new(window_size);
-        let read_half = ChannelReadHalf { receiver: rx };
+        let read_half = ChannelReadHalf {
+            receiver: rx,
+            drain_signal: drain_signal.clone(),
+        };
         let write_half = ChannelWriteHalf {
             id,
             sender,
@@ -484,6 +551,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             ChannelRef {
                 sender: tx,
                 window_size,
+                drain_signal,
             },
         )
     }
@@ -825,11 +893,41 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    /// Dequeueing a message wakes the session so it can retry what it parked
+    /// for this channel.
+    #[tokio::test]
+    async fn dequeueing_a_message_wakes_the_session() {
+        let signal = Arc::new(DrainSignal::new());
+        let (sender, receiver) = mpsc::channel(1);
+        let mut read_half = ChannelReadHalf {
+            receiver,
+            drain_signal: Some(signal.clone()),
+        };
+
+        // Nothing is parked: reading must not wake the session.
+        sender.send(ChannelMsg::Eof).await.unwrap();
+        assert!(read_half.wait().await.is_some());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), signal.notified())
+                .await
+                .is_err(),
+            "an idle session must not be woken by a read"
+        );
+
+        // The session parked a message for this channel.
+        signal.park();
+        sender.send(ChannelMsg::Eof).await.unwrap();
+        assert!(read_half.wait().await.is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.notified())
+            .await
+            .expect("reading a message must wake the session");
+    }
+
     #[tokio::test]
     async fn channel_data_bytes_forwards_to_write_half() {
         let (sender, mut receiver) = mpsc::channel(8);
         let (channel, _reference) =
-            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8);
+            Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8, None);
 
         channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
 

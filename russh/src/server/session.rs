@@ -7,6 +7,7 @@ use channels::WindowSizeRef;
 use kex::ServerKex;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel};
 use tokio::sync::oneshot;
 
@@ -23,7 +24,9 @@ pub struct Session {
     pub(crate) sender: Handle,
     pub(crate) priority_receiver: UnboundedReceiver<Msg>,
     pub(crate) receiver: Receiver<Msg>,
-    pub(crate) target_window_size: u32,
+    /// Fired when the application dequeues a channel message, to retry the
+    /// messages parked for that channel.
+    pub(crate) drain_signal: Arc<crate::channels::DrainSignal>,
     pub(crate) pending_reads: Vec<Vec<u8>>,
     pub(crate) pending_len: u32,
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
@@ -35,9 +38,11 @@ pub struct Session {
 pub enum Msg {
     ChannelOpenAgent {
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenSession {
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenDirectTcpIp {
         host_to_connect: String,
@@ -45,10 +50,12 @@ pub enum Msg {
         originator_address: String,
         originator_port: u32,
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenDirectStreamLocal {
         socket_path: String,
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenForwardedTcpIp {
         connected_address: String,
@@ -56,15 +63,18 @@ pub enum Msg {
         originator_address: String,
         originator_port: u32,
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenForwardedStreamLocal {
         server_socket_path: String,
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     ChannelOpenX11 {
         originator_address: String,
         originator_port: u32,
         channel_ref: ChannelRef,
+        window_size: Option<u32>,
     },
     TcpIpForward {
         /// Provide a channel for the reply result to request a reply from the server
@@ -113,9 +123,22 @@ pub struct Handle {
     pub(crate) priority_sender: UnboundedSender<Msg>,
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+    /// Fires when the application dequeues a channel message, waking the
+    /// session to retry the messages parked for that channel.
+    pub(crate) drain_signal: Arc<crate::channels::DrainSignal>,
+    /// Receive window requested for channels opened through this handle.
+    pub(crate) channel_window: Option<u32>,
 }
 
 impl Handle {
+    /// Return a copy of this handle that requests `window_size` as the receive
+    /// window of the channels it opens, instead of `Config::window_size`.
+    pub fn with_channel_window(&self, window_size: u32) -> Self {
+        let mut handle = self.clone();
+        handle.channel_window = Some(window_size);
+        handle
+    }
+
     /// Send data to the session referenced by this handler.
     pub async fn data(
         &self,
@@ -247,11 +270,14 @@ impl Handle {
     /// [PROTOCOL.agent](https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent).
     pub async fn channel_open_agent(&self) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
-            .send(Msg::ChannelOpenAgent { channel_ref })
+            .send(Msg::ChannelOpenAgent {
+                channel_ref,
+                window_size: self.channel_window,
+            })
             .await
             .map_err(|_| Error::SendError)?;
 
@@ -266,11 +292,14 @@ impl Handle {
     /// `confirmed` field of the corresponding `Channel`.
     pub async fn channel_open_session(&self) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
-            .send(Msg::ChannelOpenSession { channel_ref })
+            .send(Msg::ChannelOpenSession {
+                channel_ref,
+                window_size: self.channel_window,
+            })
             .await
             .map_err(|_| Error::SendError)?;
 
@@ -291,7 +320,7 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -301,6 +330,7 @@ impl Handle {
                 originator_address: originator_address.into(),
                 originator_port,
                 channel_ref,
+                window_size: self.channel_window,
             })
             .await
             .map_err(|_| Error::SendError)?;
@@ -314,13 +344,14 @@ impl Handle {
         socket_path: A,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
             .send(Msg::ChannelOpenDirectStreamLocal {
                 socket_path: socket_path.into(),
                 channel_ref,
+                window_size: self.channel_window,
             })
             .await
             .map_err(|_| Error::SendError)?;
@@ -336,7 +367,7 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -346,6 +377,7 @@ impl Handle {
                 originator_address: originator_address.into(),
                 originator_port,
                 channel_ref,
+                window_size: self.channel_window,
             })
             .await
             .map_err(|_| Error::SendError)?;
@@ -358,13 +390,14 @@ impl Handle {
         server_socket_path: A,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
             .send(Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path: server_socket_path.into(),
                 channel_ref,
+                window_size: self.channel_window,
             })
             .await
             .map_err(|_| Error::SendError)?;
@@ -378,7 +411,7 @@ impl Handle {
         originator_port: u32,
     ) -> Result<Channel<Msg>, Error> {
         let (sender, receiver) = channel(self.channel_buffer_size);
-        let channel_ref = ChannelRef::new(sender);
+        let channel_ref = ChannelRef::new_for_session(sender, self.drain_signal.clone());
         let window_size_ref = channel_ref.window_size().clone();
 
         self.sender
@@ -386,6 +419,7 @@ impl Handle {
                 originator_address: originator_address.into(),
                 originator_port,
                 channel_ref,
+                window_size: self.channel_window,
             })
             .await
             .map_err(|_| Error::SendError)?;
@@ -414,7 +448,10 @@ impl Handle {
                             max_packet_size,
                             window_size: window_size_ref,
                         },
-                        read_half: ChannelReadHalf { receiver },
+                        read_half: ChannelReadHalf {
+                            receiver,
+                            drain_signal: Some(self.drain_signal.clone()),
+                        },
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
@@ -495,7 +532,7 @@ impl Session {
     /// Dispatch a single message received on the session's internal channel
     /// (sent via [`Handle`]). Shared by the `select!` receiver arm and the
     /// pre-`select!` backlog drain so the two can't drift apart.
-    fn dispatch_msg(&mut self, msg: Msg) -> Result<(), Error> {
+    pub(crate) fn dispatch_msg(&mut self, msg: Msg) -> Result<(), Error> {
         match msg {
             Msg::Channel(id, ChannelMsg::Data { data }) => {
                 self.data(id, data)?;
@@ -535,12 +572,20 @@ impl Session {
             Msg::Channel(id, ChannelMsg::WindowAdjusted { new_size }) => {
                 debug!("window adjusted to {new_size:?} for channel {id:?}");
             }
-            Msg::ChannelOpenAgent { channel_ref } => {
-                let id = self.channel_open_agent()?;
+            Msg::ChannelOpenAgent {
+                channel_ref,
+                window_size,
+            } => {
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
+                let id = self.channel_open_agent(window_size)?;
                 self.channels.insert(id, channel_ref);
             }
-            Msg::ChannelOpenSession { channel_ref } => {
-                let id = self.channel_open_session()?;
+            Msg::ChannelOpenSession {
+                channel_ref,
+                window_size,
+            } => {
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
+                let id = self.channel_open_session(window_size)?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenDirectTcpIp {
@@ -549,20 +594,25 @@ impl Session {
                 originator_address,
                 originator_port,
                 channel_ref,
+                window_size,
             } => {
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
                 let id = self.channel_open_direct_tcpip(
                     &host_to_connect,
                     port_to_connect,
                     &originator_address,
                     originator_port,
+                    window_size,
                 )?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenDirectStreamLocal {
                 socket_path,
                 channel_ref,
+                window_size,
             } => {
-                let id = self.channel_open_direct_streamlocal(&socket_path)?;
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
+                let id = self.channel_open_direct_streamlocal(&socket_path, window_size)?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenForwardedTcpIp {
@@ -571,28 +621,37 @@ impl Session {
                 originator_address,
                 originator_port,
                 channel_ref,
+                window_size,
             } => {
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
                 let id = self.channel_open_forwarded_tcpip(
                     &connected_address,
                     connected_port,
                     &originator_address,
                     originator_port,
+                    window_size,
                 )?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path,
                 channel_ref,
+                window_size,
             } => {
-                let id = self.channel_open_forwarded_streamlocal(&server_socket_path)?;
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
+                let id =
+                    self.channel_open_forwarded_streamlocal(&server_socket_path, window_size)?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenX11 {
                 originator_address,
                 originator_port,
                 channel_ref,
+                window_size,
             } => {
-                let id = self.channel_open_x11(&originator_address, originator_port)?;
+                let window_size = window_size.unwrap_or(self.common.config.window_size);
+                let id =
+                    self.channel_open_x11(&originator_address, originator_port, window_size)?;
                 self.channels.insert(id, channel_ref);
             }
             Msg::TcpIpForward {
@@ -660,6 +719,8 @@ impl Session {
         let reading = start_reading(stream_read, buffer, opening_cipher);
         pin!(reading);
         let mut is_reading = None;
+
+        let drain_signal = self.drain_signal.clone();
 
         #[allow(clippy::panic)] // false positive in macro
         while !self.common.disconnected {
@@ -804,6 +865,11 @@ impl Session {
                             debug!("self.receiver: received None");
                         }
                     }
+                }
+                // The application read from a channel: retry its parked
+                // messages and, once it has caught up, credit its window.
+                _ = drain_signal.notified() => {
+                    self.drain_inbound()?;
                 }
             }
             self.flush()?;
@@ -1127,6 +1193,150 @@ impl Session {
         Ok(())
     }
 
+    /// Hand `msg` to the application without blocking the session loop. When
+    /// the channel's queue is full the message is parked in the channel's own
+    /// backlog and its receive window stays uncredited, so the peer stops
+    /// sending on this channel only.
+    ///
+    /// Returns `false` when the message was parked instead of queued.
+    pub(crate) fn deliver(&mut self, channel: ChannelId, msg: ChannelMsg) -> bool {
+        let Some(chan) = self.channels.get(&channel) else {
+            return true;
+        };
+        let signal = chan.drain_signal().cloned();
+
+        let Some(delivered) = Self::try_send(chan, &mut self.common, channel, msg) else {
+            return false;
+        };
+
+        if let Some(signal) = &signal
+            && delivered
+        {
+            signal.unpark();
+        }
+        delivered
+    }
+
+    /// Hand `msg` to the channel's queue, parking it behind anything already
+    /// parked for that channel. Returns `None` if it was parked.
+    fn try_send(
+        chan: &crate::channels::ChannelRef,
+        common: &mut CommonSession<Arc<crate::server::Config>>,
+        channel: ChannelId,
+        msg: ChannelMsg,
+    ) -> Option<bool> {
+        // Keep order: while messages are parked, later ones queue behind them.
+        if let Some(params) = common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&channel))
+            && !params.inbound.is_empty()
+        {
+            params.inbound.push_back(msg);
+            return None;
+        }
+
+        // Claim the parked state before the send: if the application drains
+        // concurrently, either the send succeeds or it sees the flag set.
+        if let Some(signal) = chan.drain_signal() {
+            signal.park();
+        }
+
+        match chan.try_send(msg) {
+            Ok(()) => Some(true),
+            Err(TrySendError::Full(msg)) => {
+                if let Some(params) = common
+                    .encrypted
+                    .as_mut()
+                    .and_then(|enc| enc.channels.get_mut(&channel))
+                {
+                    params.inbound.push_back(msg);
+                }
+                None
+            }
+            // Read half dropped: nobody will ever read.
+            Err(TrySendError::Closed(_)) => Some(true),
+        }
+    }
+
+    /// Retry the messages parked for channels whose queues were full, and
+    /// credit the window of the channels that have caught up.
+    pub(crate) fn drain_inbound(&mut self) -> Result<(), Error> {
+        let ids: Vec<ChannelId> = match self.common.encrypted.as_ref() {
+            Some(enc) => enc
+                .channels
+                .iter()
+                .filter(|(_, params)| !params.inbound.is_empty())
+                .map(|(id, _)| *id)
+                .collect(),
+            None => Vec::new(),
+        };
+        for id in ids {
+            loop {
+                let Some(msg) = self
+                    .common
+                    .encrypted
+                    .as_mut()
+                    .and_then(|enc| enc.channels.get_mut(&id))
+                    .and_then(|params| params.inbound.pop_front())
+                else {
+                    break;
+                };
+                let Some(sender) = self.channels.get(&id) else {
+                    // The application dropped the channel; discard the backlog.
+                    continue;
+                };
+                match sender.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(msg)) => {
+                        if let Some(ref mut enc) = self.common.encrypted
+                            && let Some(params) = enc.channels.get_mut(&id)
+                        {
+                            params.inbound.push_front(msg);
+                        }
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => {}
+                }
+            }
+
+            let Some((caught_up, peer_closed)) = self
+                .common
+                .encrypted
+                .as_ref()
+                .and_then(|enc| enc.channels.get(&id))
+                .map(|params| (params.inbound.is_empty(), params.peer_closed))
+            else {
+                continue;
+            };
+            if !caught_up {
+                continue;
+            }
+
+            // Nothing is parked any more: stop claiming the parked state.
+            if let Some(signal) = self.channels.get(&id).and_then(|chan| chan.drain_signal()) {
+                signal.unpark();
+            }
+
+            let mut wrote = false;
+            if let Some(ref mut enc) = self.common.encrypted {
+                wrote = enc.replenish_window(id)?;
+            }
+            if wrote {
+                self.flush()?;
+            }
+
+            // The application has now seen everything, including the close.
+            if peer_closed {
+                if let Some(ref mut enc) = self.common.encrypted {
+                    enc.channels.remove(&id);
+                }
+                self.channels.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     /// Send a "failure" reply to a request to open a channel open.
     pub fn channel_open_failure(
         &mut self,
@@ -1318,8 +1528,8 @@ impl Session {
     }
 
     /// Opens a new session channel on the client.
-    pub fn channel_open_session(&mut self) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"session", |_| Ok(()))
+    pub fn channel_open_session(&mut self, window_size: u32) -> Result<ChannelId, Error> {
+        self.channel_open_generic(b"session", window_size, |_| Ok(()))
     }
 
     /// Opens a direct-tcpip channel on the client (non-standard).
@@ -1329,8 +1539,9 @@ impl Session {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        window_size: u32,
     ) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"direct-tcpip", |write| {
+        self.channel_open_generic(b"direct-tcpip", window_size, |write| {
             host_to_connect.encode(write)?;
             port_to_connect.encode(write)?; // sender channel id.
             originator_address.encode(write)?;
@@ -1343,8 +1554,9 @@ impl Session {
     pub fn channel_open_direct_streamlocal(
         &mut self,
         socket_path: &str,
+        window_size: u32,
     ) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"direct-streamlocal@openssh.com", |write| {
+        self.channel_open_generic(b"direct-streamlocal@openssh.com", window_size, |write| {
             socket_path.encode(write)?;
             "".encode(write)?; // reserved
             0u32.encode(write)?; // reserved
@@ -1363,8 +1575,9 @@ impl Session {
         connected_port: u32,
         originator_address: &str,
         originator_port: u32,
+        window_size: u32,
     ) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"forwarded-tcpip", |write| {
+        self.channel_open_generic(b"forwarded-tcpip", window_size, |write| {
             connected_address.encode(write)?;
             connected_port.encode(write)?; // sender channel id.
             originator_address.encode(write)?;
@@ -1376,8 +1589,9 @@ impl Session {
     pub fn channel_open_forwarded_streamlocal(
         &mut self,
         socket_path: &str,
+        window_size: u32,
     ) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"forwarded-streamlocal@openssh.com", |write| {
+        self.channel_open_generic(b"forwarded-streamlocal@openssh.com", window_size, |write| {
             socket_path.encode(write)?;
             "".encode(write)?;
             Ok(())
@@ -1391,8 +1605,9 @@ impl Session {
         &mut self,
         originator_address: &str,
         originator_port: u32,
+        window_size: u32,
     ) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"x11", |write| {
+        self.channel_open_generic(b"x11", window_size, |write| {
             originator_address.encode(write)?;
             originator_port.encode(write)?;
             Ok(())
@@ -1400,11 +1615,16 @@ impl Session {
     }
 
     /// Opens a new agent channel on the client.
-    pub fn channel_open_agent(&mut self) -> Result<ChannelId, Error> {
-        self.channel_open_generic(b"auth-agent@openssh.com", |_| Ok(()))
+    pub fn channel_open_agent(&mut self, window_size: u32) -> Result<ChannelId, Error> {
+        self.channel_open_generic(b"auth-agent@openssh.com", window_size, |_| Ok(()))
     }
 
-    fn channel_open_generic<F>(&mut self, kind: &[u8], write_suffix: F) -> Result<ChannelId, Error>
+    fn channel_open_generic<F>(
+        &mut self,
+        kind: &[u8],
+        window_size: u32,
+        write_suffix: F,
+    ) -> Result<ChannelId, Error>
     where
         F: FnOnce(&mut Vec<u8>) -> Result<(), Error>,
     {
@@ -1416,10 +1636,8 @@ impl Session {
                 return Err(Error::Inconsistent);
             }
 
-            let sender_channel = enc.new_channel(
-                self.common.config.window_size,
-                self.common.config.maximum_packet_size,
-            );
+            let sender_channel =
+                enc.new_channel(window_size, self.common.config.maximum_packet_size);
             push_packet!(enc.write, {
                 enc.write.push(msg::CHANNEL_OPEN);
                 kind.encode(&mut enc.write)?;
@@ -1428,11 +1646,7 @@ impl Session {
                 sender_channel.encode(&mut enc.write)?;
 
                 // window.
-                self.common
-                    .config
-                    .as_ref()
-                    .window_size
-                    .encode(&mut enc.write)?;
+                window_size.encode(&mut enc.write)?;
 
                 // max packet size.
                 self.common
@@ -1626,10 +1840,13 @@ mod tests {
         let config = Arc::new(crate::server::Config::default());
         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
+        let drain_signal = Arc::new(crate::channels::DrainSignal::new());
         let handle = Handle {
             priority_sender,
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            drain_signal: drain_signal.clone(),
+            channel_window: None,
         };
 
         Session {
@@ -1671,7 +1888,7 @@ mod tests {
             sender: handle,
             priority_receiver,
             receiver,
-            target_window_size: config.window_size,
+            drain_signal,
             pending_reads: Vec::new(),
             pending_len: 0,
             channels: HashMap::new(),
@@ -1696,6 +1913,30 @@ mod tests {
         buffer.buffer.extend_from_slice(&[0; 5]);
         buffer.buffer.extend_from_slice(&compressed);
         buffer
+    }
+
+    /// Channels opened through a [`Handle`] are delivered to by the session, so
+    /// they must be wired to the drain signal: without it a full queue stays
+    /// parked and the session never credits the channel again.
+    #[tokio::test]
+    async fn handle_opened_channels_carry_the_drain_signal() {
+        let mut session = authenticated_session();
+        let handle = session.sender.clone();
+        let opening = tokio::spawn(async move { handle.channel_open_session().await });
+
+        let msg = session
+            .receiver
+            .recv()
+            .await
+            .expect("the handle must ask the session to open the channel");
+        match msg {
+            Msg::ChannelOpenSession { channel_ref, .. } => assert!(
+                channel_ref.drain_signal().is_some(),
+                "a session-delivered channel must be able to wake the session"
+            ),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        opening.abort();
     }
 
     #[tokio::test]

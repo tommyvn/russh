@@ -717,7 +717,10 @@ impl<H: Handler> Handle<H> {
                             max_packet_size,
                             window_size: window_size_ref,
                         },
-                        read_half: ChannelReadHalf { receiver },
+                        read_half: ChannelReadHalf {
+                            receiver,
+                            drain_signal: None,
+                        },
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {

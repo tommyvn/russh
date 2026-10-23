@@ -294,6 +294,17 @@ impl Encrypted {
         Ok(())
     }
 
+    /// Send `CHANNEL_CLOSE` to the peer but keep the channel's state, so the
+    /// application can still drain what was already received.
+    pub(crate) fn close_keep(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(channel) = self.has_pending_data_mut(channel) {
+            channel.pending_close = true;
+        } else {
+            self.byte(channel, msg::CHANNEL_CLOSE)?;
+        }
+        Ok(())
+    }
+
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
         if let Some(channel) = self.channels.get(&channel) {
             channel.sender_window_size as usize
@@ -306,31 +317,62 @@ impl Encrypted {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        target: u32,
     ) -> Result<bool, crate::Error> {
+        self.spend_window(channel, data);
+        self.replenish_window(channel)
+    }
+
+    /// Account for `data` bytes received on `channel`: that much of the peer's
+    /// credit is spent as the bytes arrive.
+    pub(crate) fn spend_window(&mut self, channel: ChannelId, data: &[u8]) {
         if let Some(channel) = self.channels.get_mut(&channel) {
-            trace!(
-                "adjust_window_size, channel = {}, size = {},",
-                channel.sender_channel, target
-            );
             // Ignore extra data.
             // https://tools.ietf.org/html/rfc4254#section-5.2
             if data.len() as u32 <= channel.sender_window_size {
                 channel.sender_window_size -= data.len() as u32;
             }
-            if channel.sender_window_size < target / 2 {
-                debug!(
-                    "sender_window_size {:?}, target {:?}",
-                    channel.sender_window_size, target
-                );
-                push_packet!(self.write, {
-                    self.write.push(msg::CHANNEL_WINDOW_ADJUST);
-                    channel.recipient_channel.encode(&mut self.write)?;
-                    (target - channel.sender_window_size).encode(&mut self.write)?;
-                });
-                channel.sender_window_size = target;
-                return Ok(true);
-            }
+        }
+    }
+
+    /// Restore `channel`'s receive window to its own target, if it has fallen
+    /// below half of it, and tell the peer with a `CHANNEL_WINDOW_ADJUST`.
+    ///
+    /// Withheld while the application has not caught up with what it was
+    /// already handed: the peer stops sending on this channel only.
+    pub(crate) fn replenish_window(&mut self, channel: ChannelId) -> Result<bool, crate::Error> {
+        if let Some(channel) = self.channels.get_mut(&channel)
+            && channel.inbound.is_empty()
+            && !channel.peer_closed
+        {
+            let target = channel.target_window_size;
+            return Self::replenish(&mut self.write, channel, target);
+        }
+        Ok(false)
+    }
+
+    /// Restore `channel`'s receive window to its own target, if it has fallen
+    /// below half of it, and tell the peer with a `CHANNEL_WINDOW_ADJUST`.
+    fn replenish(
+        write: &mut Vec<u8>,
+        channel: &mut ChannelParams,
+        target: u32,
+    ) -> Result<bool, crate::Error> {
+        if channel.sender_window_size < target / 2 {
+            trace!(
+                "adjust_window_size, channel = {}, size = {},",
+                channel.sender_channel, target
+            );
+            debug!(
+                "sender_window_size {:?}, target {:?}",
+                channel.sender_window_size, target
+            );
+            push_packet!(write, {
+                write.push(msg::CHANNEL_WINDOW_ADJUST);
+                channel.recipient_channel.encode(write)?;
+                (target - channel.sender_window_size).encode(write)?;
+            });
+            channel.sender_window_size = target;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -396,7 +438,17 @@ impl Encrypted {
                 self.eof(channel)?;
             }
             if pending_close {
-                self.close(channel)?;
+                // A channel the peer closed while we still owe the application
+                // its backlog is only removed once that backlog has drained.
+                if self
+                    .channels
+                    .get(&channel)
+                    .is_some_and(|channel| channel.peer_closed)
+                {
+                    self.close_keep(channel)?;
+                } else {
+                    self.close(channel)?;
+                }
             }
         }
         Ok(())
@@ -781,6 +833,9 @@ impl Encrypted {
                     confirmed: false,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),
+                    target_window_size: window_size,
+                    inbound: std::collections::VecDeque::new(),
+                    peer_closed: false,
                     pending_eof: false,
                     pending_close: false,
                 });
@@ -910,6 +965,9 @@ mod tests {
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
+            target_window_size: 1024,
+            inbound: VecDeque::new(),
+            peer_closed: false,
             pending_eof,
             pending_close,
         }
@@ -964,6 +1022,9 @@ mod tests {
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
+            target_window_size: 1024,
+            inbound: VecDeque::new(),
+            peer_closed: false,
             pending_eof,
             pending_close,
         }

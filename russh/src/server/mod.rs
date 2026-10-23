@@ -497,7 +497,10 @@ pub trait Handler: Sized {
     }
 
     /// Called when this server adjusts the network window. Return the
-    /// next target window.
+    /// next target window for `channel`.
+    ///
+    /// This is per channel: `current` is the target of `channel`, and the
+    /// returned value only re-tunes that channel's receive window.
     #[allow(unused_variables)]
     fn adjust_window(&mut self, channel: ChannelId, current: u32) -> u32 {
         current
@@ -1069,15 +1072,18 @@ where
     let mut stream = SshRead::new(stream);
     let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
+    let drain_signal = Arc::new(crate::channels::DrainSignal::new());
     let handle = server::session::Handle {
         priority_sender,
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        drain_signal: drain_signal.clone(),
+        channel_window: None,
     };
 
     let common = read_ssh_id(config, &mut stream).await?;
     let mut session = Session {
-        target_window_size: common.config.window_size,
+        drain_signal,
         common,
         priority_receiver,
         receiver,

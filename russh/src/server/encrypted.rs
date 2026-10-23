@@ -577,10 +577,31 @@ mod tests {
     struct ChannelCallbackProbe {
         exec_called: bool,
         window_adjusted_called: bool,
+        received: Vec<(ChannelId, Vec<u8>)>,
+        closed: Vec<ChannelId>,
     }
 
     impl Handler for ChannelCallbackProbe {
         type Error = Error;
+
+        async fn channel_close(
+            &mut self,
+            channel: ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.closed.push(channel);
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.received.push((channel, data.to_vec()));
+            Ok(())
+        }
 
         async fn exec_request(
             &mut self,
@@ -626,6 +647,532 @@ mod tests {
             .channels
             .insert(channel, crate::channels::ChannelRef::new(sender));
         channel
+    }
+
+    /// A confirmed, server-initiated channel whose delivery queue has the
+    /// given capacity, wired to the session like a real one. Tests can drain
+    /// it, or deliberately never drain it.
+    fn insert_established_server_open(
+        session: &mut Session,
+        capacity: usize,
+    ) -> (ChannelId, Channel<Msg>) {
+        let id = session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .new_channel(
+                session.common.config.window_size,
+                session.common.config.maximum_packet_size,
+            );
+        let (channel, channel_ref) = Channel::new(
+            id,
+            session.sender.sender.clone(),
+            session.common.config.maximum_packet_size,
+            session.common.config.window_size,
+            capacity,
+            Some(session.drain_signal.clone()),
+        );
+        session.channels.insert(id, channel_ref);
+        session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .channels
+            .get_mut(&id)
+            .expect("channel params present")
+            .confirmed = true;
+        (id, channel)
+    }
+
+    fn channel_data_payload(channel: ChannelId, data: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(msg::CHANNEL_DATA);
+        channel.encode(&mut packet).unwrap();
+        (data.len() as u32).encode(&mut packet).unwrap();
+        packet.extend_from_slice(data);
+        packet
+    }
+
+    fn channel_close_payload(channel: ChannelId) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(msg::CHANNEL_CLOSE);
+        channel.encode(&mut packet).unwrap();
+        packet
+    }
+
+    /// A channel whose application has stopped reading must not stall the
+    /// session loop: a full queue parks the message for that channel only.
+    #[tokio::test]
+    async fn full_channel_queue_does_not_stall_the_session() {
+        let mut session = test_authenticated_session();
+        let (slow, _slow) = insert_established_server_open(&mut session, 1);
+        let (fast, mut fast_channel) = insert_established_server_open(&mut session, 4);
+        let mut handler = ChannelCallbackProbe::default();
+
+        // Fill the slow channel's queue; its receiver is never drained.
+        session
+            .process_packet(&mut handler, &channel_data_payload(slow, b"first"))
+            .await
+            .unwrap();
+
+        // One more packet for the same channel must not park the session.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.process_packet(&mut handler, &channel_data_payload(slow, b"second")),
+        )
+        .await
+        .expect("a full channel queue must not stall the session loop")
+        .expect("process_packet must not fail");
+
+        // The other channel on the same session still makes progress.
+        session
+            .process_packet(&mut handler, &channel_data_payload(fast, b"hello"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                fast_channel.read_half.receiver.try_recv(),
+                Ok(ChannelMsg::Data { data }) if &data[..] == b"hello"
+            ),
+            "a slow channel starved a fast channel on the same session"
+        );
+    }
+
+    fn channel_window(session: &Session, channel: ChannelId) -> u32 {
+        session
+            .common
+            .encrypted
+            .as_ref()
+            .expect("test session has encrypted state")
+            .channels
+            .get(&channel)
+            .expect("channel params present")
+            .sender_window_size
+    }
+
+    fn channel_target(session: &Session, channel: ChannelId) -> u32 {
+        session
+            .common
+            .encrypted
+            .as_ref()
+            .expect("test session has encrypted state")
+            .channels
+            .get(&channel)
+            .expect("channel params present")
+            .target_window_size
+    }
+
+    fn channel_backlog(session: &Session, channel: ChannelId) -> usize {
+        session
+            .common
+            .encrypted
+            .as_ref()
+            .expect("test session has encrypted state")
+            .channels
+            .get(&channel)
+            .expect("channel params present")
+            .inbound
+            .len()
+    }
+
+    fn set_channel_windows(session: &mut Session, channel: ChannelId, target: u32, window: u32) {
+        let params = session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .channels
+            .get_mut(&channel)
+            .expect("channel params present");
+        params.target_window_size = target;
+        params.sender_window_size = window;
+    }
+
+    /// The window of a `CHANNEL_OPEN` packet: `[u32 len][CHANNEL_OPEN][string
+    /// type][u32 sender][u32 window]`.
+    fn channel_open_window(buf: &[u8]) -> u32 {
+        use byteorder::{BigEndian, ByteOrder};
+
+        assert_eq!(buf[4], msg::CHANNEL_OPEN, "expected a CHANNEL_OPEN packet");
+        let type_len = BigEndian::read_u32(&buf[5..9]) as usize;
+        let window_at = 9 + type_len + 4;
+        BigEndian::read_u32(&buf[window_at..window_at + 4])
+    }
+
+    #[derive(Default)]
+    struct WindowTargetProbe {
+        bump: u32,
+    }
+
+    impl Handler for WindowTargetProbe {
+        type Error = Error;
+
+        fn adjust_window(&mut self, _channel: ChannelId, current: u32) -> u32 {
+            current + self.bump
+        }
+    }
+
+    /// `Handler::adjust_window`'s return value applies to the channel it was
+    /// called for, and each channel is credited back to its own target.
+    #[tokio::test]
+    async fn window_target_is_per_channel() {
+        let mut session = test_authenticated_session();
+        let (a, _a) = insert_established_server_open(&mut session, 4);
+        let (b, _b) = insert_established_server_open(&mut session, 4);
+        for channel in [a, b] {
+            set_channel_windows(&mut session, channel, 100, 100);
+        }
+        let mut handler = WindowTargetProbe { bump: 100 };
+
+        // A's window falls below half, so it is credited to A's target and the
+        // handler raises A's target.
+        session
+            .process_packet(&mut handler, &channel_data_payload(a, &[0; 60]))
+            .await
+            .unwrap();
+        assert_eq!(
+            channel_window(&session, a),
+            100,
+            "a channel must be credited back to its own target"
+        );
+        assert_eq!(
+            channel_target(&session, a),
+            200,
+            "adjust_window's return value must apply to the channel it was called for"
+        );
+
+        // B is credited to B's target (100), not to the target just set for A.
+        session
+            .process_packet(&mut handler, &channel_data_payload(b, &[0; 60]))
+            .await
+            .unwrap();
+        assert_eq!(
+            channel_window(&session, b),
+            100,
+            "a target set for one channel must not re-tune another channel's window"
+        );
+        assert_eq!(channel_target(&session, b), 200);
+    }
+
+    /// A channel whose backlog has not drained gets no credit; an unblocked
+    /// channel on the same session still does.
+    #[tokio::test]
+    async fn blocked_channel_gets_no_window_credit() {
+        let mut session = test_authenticated_session();
+        let (blocked, _blocked) = insert_established_server_open(&mut session, 1);
+        let (open, _open) = insert_established_server_open(&mut session, 4);
+        for channel in [blocked, open] {
+            set_channel_windows(&mut session, channel, 100, 60);
+        }
+        let mut handler = ChannelCallbackProbe::default();
+
+        // The blocked channel's queue holds one message; the next one is
+        // parked, so its window must stop being credited.
+        for _ in 0..2 {
+            session
+                .process_packet(&mut handler, &channel_data_payload(blocked, &[0; 10]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(channel_backlog(&session, blocked), 1);
+        assert_eq!(
+            channel_window(&session, blocked),
+            40,
+            "a channel with a backlog must not be credited"
+        );
+
+        // The unblocked channel crosses the same threshold and is credited.
+        for _ in 0..2 {
+            session
+                .process_packet(&mut handler, &channel_data_payload(open, &[0; 10]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            channel_window(&session, open),
+            100,
+            "an unblocked channel must still be credited"
+        );
+    }
+
+    /// Reading from a channel delivers what was parked for it, in order, and
+    /// credits its window once it has caught up.
+    #[tokio::test]
+    async fn draining_a_channel_delivers_its_backlog() {
+        let mut session = test_authenticated_session();
+        let (channel, mut opened) = insert_established_server_open(&mut session, 1);
+        set_channel_windows(&mut session, channel, 100, 60);
+        let mut handler = ChannelCallbackProbe::default();
+
+        // The first message fills the queue, the second is parked.
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            session
+                .process_packet(&mut handler, &channel_data_payload(channel, payload))
+                .await
+                .unwrap();
+        }
+        assert_eq!(channel_backlog(&session, channel), 1);
+        assert_eq!(channel_window(&session, channel), 49);
+
+        // The application reads one message; the session retries the backlog.
+        assert!(matches!(
+            opened.read_half.receiver.try_recv(),
+            Ok(ChannelMsg::Data { data }) if &data[..] == b"first"
+        ));
+        session.drain_inbound().unwrap();
+        assert!(matches!(
+            opened.read_half.receiver.try_recv(),
+            Ok(ChannelMsg::Data { data }) if &data[..] == b"second"
+        ));
+        assert_eq!(channel_backlog(&session, channel), 0);
+        assert_eq!(
+            channel_window(&session, channel),
+            100,
+            "a channel must be credited once its backlog has drained"
+        );
+        assert!(
+            !session.channels[&channel]
+                .drain_signal()
+                .expect("server channels carry a drain signal")
+                .is_parked(),
+            "a channel with nothing parked must not keep waking the session"
+        );
+    }
+
+    /// Nothing parked for a channel is lost, and order is preserved.
+    #[tokio::test]
+    async fn parked_data_is_delivered_in_order() {
+        let mut session = test_authenticated_session();
+        let (channel, mut opened) = insert_established_server_open(&mut session, 1);
+        let mut handler = ChannelCallbackProbe::default();
+        let payloads: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 4]).collect();
+
+        for payload in &payloads {
+            session
+                .process_packet(&mut handler, &channel_data_payload(channel, payload))
+                .await
+                .unwrap();
+        }
+
+        let mut received = Vec::new();
+        while received.len() < payloads.len() {
+            session.drain_inbound().unwrap();
+            match opened.read_half.receiver.try_recv() {
+                Ok(ChannelMsg::Data { data }) => received.push(data.to_vec()),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            received, payloads,
+            "parked data must be delivered in order without loss"
+        );
+        assert_eq!(
+            handler.received.len(),
+            payloads.len(),
+            "handler.data must still see every packet"
+        );
+    }
+
+    /// A close that arrives while the channel's queue is full must neither
+    /// stall the session nor lose the backlog: the close is delivered once the
+    /// application has drained it, and the channel is released afterwards.
+    #[tokio::test]
+    async fn close_with_a_full_queue_keeps_the_backlog() {
+        let mut session = test_authenticated_session();
+        let (channel, mut opened) = insert_established_server_open(&mut session, 1);
+        let mut handler = ChannelCallbackProbe::default();
+
+        session
+            .process_packet(&mut handler, &channel_data_payload(channel, b"first"))
+            .await
+            .unwrap();
+        session
+            .process_packet(&mut handler, &channel_data_payload(channel, b"second"))
+            .await
+            .unwrap();
+        assert_eq!(channel_backlog(&session, channel), 1);
+
+        // The peer closes while the queue is still full.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.process_packet(&mut handler, &channel_close_payload(channel)),
+        )
+        .await
+        .expect("a close must not stall the session loop")
+        .expect("process_packet must not fail");
+
+        assert!(matches!(
+            opened.read_half.receiver.try_recv(),
+            Ok(ChannelMsg::Data { data }) if &data[..] == b"first"
+        ));
+        session.drain_inbound().unwrap();
+        assert!(matches!(
+            opened.read_half.receiver.try_recv(),
+            Ok(ChannelMsg::Data { data }) if &data[..] == b"second"
+        ));
+        session.drain_inbound().unwrap();
+        assert!(
+            matches!(opened.read_half.receiver.try_recv(), Ok(ChannelMsg::Close)),
+            "the application must still see the close, after the data"
+        );
+
+        assert_eq!(handler.closed, vec![channel]);
+        assert!(
+            !session.channels.contains_key(&channel),
+            "the channel handle must be released once the backlog has drained"
+        );
+        assert!(
+            !session
+                .common
+                .encrypted
+                .as_ref()
+                .expect("test session has encrypted state")
+                .channels
+                .contains_key(&channel),
+            "the channel state must be released once the backlog has drained"
+        );
+    }
+
+    /// The window is credited only once `Handler::data` has returned.
+    #[tokio::test]
+    async fn window_is_credited_after_handler_data() {
+        #[derive(Default)]
+        struct WindowInHandler {
+            window: Option<u32>,
+        }
+
+        impl Handler for WindowInHandler {
+            type Error = Error;
+
+            async fn data(
+                &mut self,
+                channel: ChannelId,
+                _data: &[u8],
+                session: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.window = Some(
+                    session
+                        .common
+                        .encrypted
+                        .as_ref()
+                        .expect("test session has encrypted state")
+                        .channels[&channel]
+                        .sender_window_size,
+                );
+                Ok(())
+            }
+        }
+
+        let mut session = test_authenticated_session();
+        let (channel, _opened) = insert_established_server_open(&mut session, 4);
+        set_channel_windows(&mut session, channel, 100, 60);
+        let mut handler = WindowInHandler::default();
+
+        session
+            .process_packet(&mut handler, &channel_data_payload(channel, &[0; 20]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handler.window,
+            Some(40),
+            "the window must not be credited before the handler has consumed the data"
+        );
+        assert_eq!(
+            channel_window(&session, channel),
+            100,
+            "the window must be credited once the handler returns"
+        );
+    }
+
+    /// `accept_with_window` advertises the requested window and sizes the
+    /// channel to it.
+    #[tokio::test]
+    async fn accept_with_window_sets_the_confirmation_window() {
+        let mut session = test_authenticated_session();
+        let channel_id = session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .new_channel(1024, 1024);
+        let channel_params = session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state")
+            .channels
+            .remove(&channel_id)
+            .expect("channel params present");
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let pending = crate::PendingChannelOpen {
+            recipient_channel: 3,
+            sender_channel: channel_id,
+            window_size: 1024,
+            packet_size: 1024,
+            channel_ref: crate::channels::ChannelRef::new(sender),
+            channel_params,
+        };
+        let (reply_sender, mut reply_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let reply = crate::ChannelOpenHandleInner::new(reply_sender, pending, |pending, result| {
+            Msg::ChannelOpenReply { pending, result }
+        });
+
+        reply.accept_with_window(4096).await;
+
+        match reply_receiver.try_recv().expect("reply sent") {
+            Msg::ChannelOpenReply { pending, result } => {
+                assert!(result.is_ok());
+                assert_eq!(
+                    pending.window_size, 4096,
+                    "the confirmation must advertise the requested window"
+                );
+                assert_eq!(pending.channel_params.sender_window_size, 4096);
+                assert_eq!(pending.channel_params.target_window_size, 4096);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// `Handle::with_channel_window` puts the requested window on the wire and
+    /// sizes the new channel to it.
+    #[tokio::test]
+    async fn with_channel_window_sets_the_channel_open_window() {
+        let mut session = test_authenticated_session();
+        let handle = session.handle();
+        assert_eq!(handle.with_channel_window(4096).channel_window, Some(4096));
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        session
+            .dispatch_msg(Msg::ChannelOpenForwardedTcpIp {
+                connected_address: "127.0.0.1".into(),
+                connected_port: 80,
+                originator_address: "127.0.0.1".into(),
+                originator_port: 1234,
+                channel_ref: crate::channels::ChannelRef::new(sender),
+                window_size: handle.with_channel_window(4096).channel_window,
+            })
+            .unwrap();
+
+        let id = ChannelId(1);
+        assert_eq!(channel_target(&session, id), 4096);
+        assert_eq!(channel_window(&session, id), 4096);
+        assert_eq!(
+            channel_open_window(
+                &session
+                    .common
+                    .encrypted
+                    .as_ref()
+                    .expect("test session has encrypted state")
+                    .write
+            ),
+            4096,
+            "the CHANNEL_OPEN frame must advertise the requested window"
+        );
     }
 
     /// A locally-initiated close (`Session::close`) must drop the `ChannelRef`
@@ -726,14 +1273,17 @@ mod tests {
         let config = Arc::new(config);
         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let drain_signal = Arc::new(crate::channels::DrainSignal::new());
         let handle = Handle {
             priority_sender,
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            drain_signal: drain_signal.clone(),
+            channel_window: None,
         };
 
         Session {
-            target_window_size: config.window_size,
+            drain_signal,
             common: CommonSession {
                 packet_writer: PacketWriter::clear(),
                 auth_user: String::new(),
@@ -1319,17 +1869,34 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
+                // The peer's echo of a close we already replied to while the
+                // application still had a backlog to drain.
+                if let Some(ref enc) = self.common.encrypted
+                    && enc
+                        .channels
+                        .get(&channel_num)
+                        .is_some_and(|c| c.peer_closed)
+                {
+                    return Ok(());
+                }
+                // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3. If the
+                // application has not drained its queue yet, keep the channel
+                // around so the parked messages and this close can still be
+                // delivered.
+                let delivered = self.deliver(channel_num, ChannelMsg::Close);
                 if let Some(ref mut enc) = self.common.encrypted {
-                    // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
-                    enc.close(channel_num)?;
+                    if delivered {
+                        enc.close(channel_num)?;
+                    } else {
+                        enc.close_keep(channel_num)?;
+                        if let Some(params) = enc.channels.get_mut(&channel_num) {
+                            params.peer_closed = true;
+                        }
+                    }
                 }
-                // Forward the close to the channel before removing it, so that
-                // consumers waiting on `Channel::wait()` receive an explicit
-                // `ChannelMsg::Close` instead of just seeing `None`.
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Close).await.unwrap_or(())
+                if delivered {
+                    self.channels.remove(&channel_num);
                 }
-                self.channels.remove(&channel_num);
                 debug!("handler.channel_close {channel_num:?}");
                 handler.channel_close(channel_num, self).await
             }
@@ -1339,9 +1906,7 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Eof).await.unwrap_or(())
-                }
+                self.deliver(channel_num, ChannelMsg::Eof);
                 debug!("handler.channel_eof {channel_num:?}");
                 handler.channel_eof(channel_num, self).await
             }
@@ -1359,36 +1924,49 @@ impl Session {
                 trace!("handler.data {ext:?} {channel_num:?}");
                 let data = map_err!(Bytes::decode(r))?;
                 map_err!(ensure_end(r))?;
-                let target = self.target_window_size;
 
+                // Never block the session loop on a full channel queue: park
+                // the copy in the channel's own backlog and stop crediting its
+                // window until the application has drained it.
+                let msg = match ext {
+                    Some(ext) => ChannelMsg::ExtendedData {
+                        ext,
+                        data: data.clone(),
+                    },
+                    None => ChannelMsg::Data { data: data.clone() },
+                };
+                self.deliver(channel_num, msg);
+
+                // The peer's credit is spent as the bytes arrive...
+                if let Some(ref mut enc) = self.common.encrypted {
+                    enc.spend_window(channel_num, &data);
+                }
+
+                if let Some(ext) = ext {
+                    handler.extended_data(channel_num, ext, &data, self).await?;
+                } else {
+                    handler.data(channel_num, &data, self).await?;
+                }
+
+                // ...and credited back for this channel only, once the handler
+                // has consumed the data.
                 #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let window = handler.adjust_window(channel_num, self.target_window_size);
-                        if window > 0 {
-                            self.target_window_size = window
+                    if enc.replenish_window(channel_num)? {
+                        let current = enc
+                            .channels
+                            .get(&channel_num)
+                            .map_or(0, |c| c.target_window_size);
+                        let window = handler.adjust_window(channel_num, current);
+                        if window > 0
+                            && let Some(channel) = enc.channels.get_mut(&channel_num)
+                        {
+                            channel.target_window_size = window;
                         }
                     }
                 }
                 self.flush()?;
-                if let Some(ext) = ext {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::ExtendedData {
-                            ext,
-                            data: data.clone(),
-                        })
-                        .await
-                        .unwrap_or(())
-                    }
-                    handler.extended_data(channel_num, ext, &data, self).await
-                } else {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::Data { data: data.clone() })
-                            .await
-                            .unwrap_or(())
-                    }
-                    handler.data(channel_num, &data, self).await
-                }
+                Ok(())
             }
 
             msg::CHANNEL_WINDOW_ADJUST => {
@@ -1530,24 +2108,23 @@ impl Session {
                         }
                         map_err!(ensure_end(r))?;
 
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            // Only the first `i` entries were decoded from the
-                            // request; the rest of `modes` is padding and must
-                            // not be passed on as if the client had sent it.
-                            #[allow(clippy::indexing_slicing)] // `i <= modes.len()` checked above
-                            let terminal_modes = modes[..i].to_vec();
-                            let _ = chan
-                                .send(ChannelMsg::RequestPty {
-                                    want_reply: true,
-                                    term: term.clone(),
-                                    col_width,
-                                    row_height,
-                                    pix_width,
-                                    pix_height,
-                                    terminal_modes,
-                                })
-                                .await;
-                        }
+                        // Only the first `i` entries were decoded from the
+                        // request; the rest of `modes` is padding and must
+                        // not be passed on as if the client had sent it.
+                        #[allow(clippy::indexing_slicing)] // `i <= modes.len()` checked above
+                        let terminal_modes = modes[..i].to_vec();
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::RequestPty {
+                                want_reply: true,
+                                term: term.clone(),
+                                col_width,
+                                row_height,
+                                pix_width,
+                                pix_height,
+                                terminal_modes,
+                            },
+                        );
 
                         debug!("handler.pty_request {channel_num:?}");
                         #[allow(clippy::indexing_slicing)] // `modes` length checked
@@ -1571,17 +2148,16 @@ impl Session {
                         let x11_screen_number = map_err!(u32::decode(r))?;
                         map_err!(ensure_end(r))?;
 
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestX11 {
-                                    want_reply: true,
-                                    single_connection,
-                                    x11_authentication_cookie: x11_auth_cookie.clone(),
-                                    x11_authentication_protocol: x11_auth_protocol.clone(),
-                                    x11_screen_number,
-                                })
-                                .await;
-                        }
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::RequestX11 {
+                                want_reply: true,
+                                single_connection,
+                                x11_authentication_cookie: x11_auth_cookie.clone(),
+                                x11_authentication_protocol: x11_auth_protocol.clone(),
+                                x11_screen_number,
+                            },
+                        );
                         debug!("handler.x11_request {channel_num:?}");
                         handler
                             .x11_request(
@@ -1599,15 +2175,14 @@ impl Session {
                         let env_value = map_err!(String::decode(r))?;
                         map_err!(ensure_end(r))?;
 
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::SetEnv {
-                                    want_reply: true,
-                                    variable_name: env_variable.clone(),
-                                    variable_value: env_value.clone(),
-                                })
-                                .await;
-                        }
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::SetEnv {
+                                want_reply: true,
+                                variable_name: env_variable.clone(),
+                                variable_value: env_value.clone(),
+                            },
+                        );
 
                         debug!("handler.env_request {channel_num:?}");
                         handler
@@ -1616,21 +2191,13 @@ impl Session {
                     }
                     "shell" => {
                         map_err!(ensure_end(r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestShell { want_reply: true })
-                                .await;
-                        }
+                        self.deliver(channel_num, ChannelMsg::RequestShell { want_reply: true });
                         debug!("handler.shell_request {channel_num:?}");
                         handler.shell_request(channel_num, self).await
                     }
                     "auth-agent-req@openssh.com" => {
                         map_err!(ensure_end(r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::AgentForward { want_reply: true })
-                                .await;
-                        }
+                        self.deliver(channel_num, ChannelMsg::AgentForward { want_reply: true });
                         debug!("handler.agent_request {channel_num:?}");
 
                         let response = handler.agent_request(channel_num, self).await?;
@@ -1644,14 +2211,13 @@ impl Session {
                     "exec" => {
                         let req = map_err!(Bytes::decode(r))?;
                         map_err!(ensure_end(r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::Exec {
-                                    want_reply: true,
-                                    command: req.to_vec(),
-                                })
-                                .await;
-                        }
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::Exec {
+                                want_reply: true,
+                                command: req.to_vec(),
+                            },
+                        );
                         debug!("handler.exec_request {channel_num:?}");
                         handler.exec_request(channel_num, &req, self).await
                     }
@@ -1659,14 +2225,13 @@ impl Session {
                         let name = map_err!(String::decode(r))?;
                         map_err!(ensure_end(r))?;
 
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestSubsystem {
-                                    want_reply: true,
-                                    name: name.clone(),
-                                })
-                                .await;
-                        }
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::RequestSubsystem {
+                                want_reply: true,
+                                name: name.clone(),
+                            },
+                        );
                         debug!("handler.subsystem_request {channel_num:?}");
                         handler.subsystem_request(channel_num, &name, self).await
                     }
@@ -1677,16 +2242,15 @@ impl Session {
                         let pix_height = map_err!(u32::decode(r))?;
                         map_err!(ensure_end(r))?;
 
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::WindowChange {
-                                    col_width,
-                                    row_height,
-                                    pix_width,
-                                    pix_height,
-                                })
-                                .await;
-                        }
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::WindowChange {
+                                col_width,
+                                row_height,
+                                pix_width,
+                                pix_height,
+                            },
+                        );
 
                         debug!("handler.window_change {channel_num:?}");
                         handler
@@ -1703,13 +2267,12 @@ impl Session {
                     "signal" => {
                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
                         map_err!(ensure_end(r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            chan.send(ChannelMsg::Signal {
+                        self.deliver(
+                            channel_num,
+                            ChannelMsg::Signal {
                                 signal: signal.clone(),
-                            })
-                            .await
-                            .unwrap_or(())
-                        }
+                            },
+                        );
                         debug!("handler.signal {channel_num:?} {signal:?}");
                         handler.signal(channel_num, signal, self).await
                     }
@@ -1921,6 +2484,9 @@ impl Session {
             confirmed: true,
             wants_reply: false,
             pending_data: std::collections::VecDeque::new(),
+            target_window_size: self.common.config.window_size,
+            inbound: std::collections::VecDeque::new(),
+            peer_closed: false,
             pending_eof: false,
             pending_close: false,
         };
@@ -1931,6 +2497,7 @@ impl Session {
             channel_params.recipient_maximum_packet_size,
             channel_params.recipient_window_size,
             self.common.config.channel_buffer_size,
+            Some(self.drain_signal.clone()),
         );
 
         let pending = PendingChannelOpen {

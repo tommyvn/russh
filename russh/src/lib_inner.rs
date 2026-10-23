@@ -510,6 +510,15 @@ pub(crate) struct ChannelParams {
     wants_reply: bool,
     /// (buffer, extended stream #, data offset in buffer)
     pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
+    /// The level this channel's receive window is replenished to.
+    target_window_size: u32,
+    /// Messages that could not be handed to the application because its queue
+    /// was full. While this is non-empty the channel's receive window is not
+    /// replenished, so the peer stops sending on this channel only.
+    inbound: std::collections::VecDeque<crate::channels::ChannelMsg>,
+    /// The peer sent `CHANNEL_CLOSE` but the application has not drained the
+    /// backlog yet; the entry is removed once it does.
+    peer_closed: bool,
     pending_eof: bool,
     pending_close: bool,
 }
@@ -595,6 +604,17 @@ impl<M: Send> ChannelOpenHandleInner<M> {
     /// Accept the channel open request.
     pub async fn accept(mut self) {
         if let Some(pending) = self.inner.take() {
+            let _ = self.sender.send((self.make_msg)(pending, Ok(())));
+        }
+    }
+
+    /// Accept the channel open request, granting the peer `window_size` bytes
+    /// of receive window instead of the session-wide `Config::window_size`.
+    pub async fn accept_with_window(mut self, window_size: u32) {
+        if let Some(mut pending) = self.inner.take() {
+            pending.window_size = window_size;
+            pending.channel_params.sender_window_size = window_size;
+            pending.channel_params.target_window_size = window_size;
             let _ = self.sender.send((self.make_msg)(pending, Ok(())));
         }
     }
